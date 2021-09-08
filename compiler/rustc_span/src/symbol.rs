@@ -339,6 +339,7 @@ symbols! {
         attr_literals,
         attributes,
         augmented_assignments,
+        auto_clone,
         auto_traits,
         automatically_derived,
         avx512_target_feature,

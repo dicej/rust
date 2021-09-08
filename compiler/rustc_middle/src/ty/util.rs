@@ -128,7 +128,11 @@ impl IntTypeExt for attr::IntType {
         if let Some(val) = val {
             assert_eq!(self.to_ty(tcx), val.ty);
             let (new, oflo) = val.checked_add(tcx, 1);
-            if oflo { None } else { Some(new) }
+            if oflo {
+                None
+            } else {
+                Some(new)
+            }
         } else {
             Some(self.initial_discriminant(tcx))
         }
@@ -544,7 +548,11 @@ impl<'tcx> TyCtxt<'tcx> {
         };
 
         let expanded_type = visitor.expand_opaque_ty(def_id, substs).unwrap();
-        if visitor.found_recursion { Err(expanded_type) } else { Ok(expanded_type) }
+        if visitor.found_recursion {
+            Err(expanded_type)
+        } else {
+            Ok(expanded_type)
+        }
     }
 }
 
@@ -762,6 +770,15 @@ impl<'tcx> ty::TyS<'tcx> {
             | ty::Placeholder(_)
             | ty::Projection(_) => false,
         }
+    }
+
+    /// Checks whether values of this type `T` implement the `AutoClone` trait.
+    pub fn is_auto_clone(
+        &'tcx self,
+        tcx_at: TyCtxtAt<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+    ) -> bool {
+        tcx_at.is_auto_clone_raw(param_env.and(self))
     }
 
     /// If `ty.needs_drop(...)` returns `true`, then `ty` is definitely
@@ -1052,7 +1069,11 @@ where
     // Look for the first element that changed
     if let Some((i, new_t)) = iter.by_ref().enumerate().find_map(|(i, t)| {
         let new_t = t.fold_with(folder);
-        if new_t == t { None } else { Some((i, new_t)) }
+        if new_t == t {
+            None
+        } else {
+            Some((i, new_t))
+        }
     }) {
         // An element changed, prepare to intern the resulting list
         let mut new_list = SmallVec::<[_; 8]>::with_capacity(list.len());

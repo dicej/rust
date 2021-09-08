@@ -48,6 +48,141 @@ enum StorageDeadOrDrop<'tcx> {
     Destructor(Ty<'tcx>),
 }
 
+fn get_moved_indexes<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    dominators: &Dominators<BasicBlock>,
+    move_data: &MoveData<'tcx>,
+    location: Location,
+    mpi: MovePathIndex,
+) -> (Vec<MoveSite>, Vec<Location>) {
+    fn predecessor_locations(
+        body: &'a mir::Body<'tcx>,
+        location: Location,
+    ) -> impl Iterator<Item = Location> + 'a {
+        if location.statement_index == 0 {
+            let predecessors = body.predecessors()[location.block].to_vec();
+            Either::Left(predecessors.into_iter().map(move |bb| body.terminator_loc(bb)))
+        } else {
+            Either::Right(std::iter::once(Location {
+                statement_index: location.statement_index - 1,
+                ..location
+            }))
+        }
+    }
+
+    let mut stack = Vec::new();
+    stack.extend(predecessor_locations(body, location).map(|predecessor| {
+        let is_back_edge = location.dominates(predecessor, dominators);
+        (predecessor, is_back_edge)
+    }));
+
+    let mut visited = FxHashSet::default();
+    let mut move_locations = FxHashSet::default();
+    let mut reinits = vec![];
+    let mut result = vec![];
+
+    'dfs: while let Some((location, is_back_edge)) = stack.pop() {
+        debug!(
+            "report_use_of_moved_or_uninitialized: (current_location={:?}, back_edge={})",
+            location, is_back_edge
+        );
+
+        if !visited.insert(location) {
+            continue;
+        }
+
+        // check for moves
+        let stmt_kind =
+            body[location.block].statements.get(location.statement_index).map(|s| &s.kind);
+        if let Some(StatementKind::StorageDead(..)) = stmt_kind {
+            // this analysis only tries to find moves explicitly
+            // written by the user, so we ignore the move-outs
+            // created by `StorageDead` and at the beginning
+            // of a function.
+        } else {
+            // If we are found a use of a.b.c which was in error, then we want to look for
+            // moves not only of a.b.c but also a.b and a.
+            //
+            // Note that the moves data already includes "parent" paths, so we don't have to
+            // worry about the other case: that is, if there is a move of a.b.c, it is already
+            // marked as a move of a.b and a as well, so we will generate the correct errors
+            // there.
+            let mut mpis = vec![mpi];
+            let move_paths = &move_data.move_paths;
+            mpis.extend(move_paths[mpi].parents(move_paths).map(|(mpi, _)| mpi));
+
+            for moi in &move_data.loc_map[location] {
+                debug!("report_use_of_moved_or_uninitialized: moi={:?}", moi);
+                let path = move_data.moves[*moi].path;
+                if mpis.contains(&path) {
+                    debug!(
+                        "report_use_of_moved_or_uninitialized: found {:?}",
+                        move_paths[path].place
+                    );
+                    result.push(MoveSite { moi: *moi, traversed_back_edge: is_back_edge });
+                    move_locations.insert(location);
+
+                    // Strictly speaking, we could continue our DFS here. There may be
+                    // other moves that can reach the point of error. But it is kind of
+                    // confusing to highlight them.
+                    //
+                    // Example:
+                    //
+                    // ```
+                    // let a = vec![];
+                    // let b = a;
+                    // let c = a;
+                    // drop(a); // <-- current point of error
+                    // ```
+                    //
+                    // Because we stop the DFS here, we only highlight `let c = a`,
+                    // and not `let b = a`. We will of course also report an error at
+                    // `let c = a` which highlights `let b = a` as the move.
+                    continue 'dfs;
+                }
+            }
+        }
+
+        // check for inits
+        let mut any_match = false;
+        drop_flag_effects::for_location_inits(tcx, body, move_data, location, |m| {
+            if m == mpi {
+                any_match = true;
+            }
+        });
+        if any_match {
+            reinits.push(location);
+            continue 'dfs;
+        }
+
+        stack.extend(predecessor_locations(body, location).map(|predecessor| {
+            let back_edge = location.dominates(predecessor, dominators);
+            (predecessor, is_back_edge || back_edge)
+        }));
+    }
+
+    // Check if we can reach these reinits from a move location.
+    let reinits_reachable = reinits
+        .into_iter()
+        .filter(|reinit| {
+            let mut visited = FxHashSet::default();
+            let mut stack = vec![*reinit];
+            while let Some(location) = stack.pop() {
+                if !visited.insert(location) {
+                    continue;
+                }
+                if move_locations.contains(&location) {
+                    return true;
+                }
+                stack.extend(predecessor_locations(body, location));
+            }
+            false
+        })
+        .collect::<Vec<Location>>();
+    (result, reinits_reachable)
+}
+
 impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
     pub(in crate::borrow_check) fn report_use_of_moved_or_uninitialized(
         &mut self,
@@ -1501,137 +1636,14 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         location: Location,
         mpi: MovePathIndex,
     ) -> (Vec<MoveSite>, Vec<Location>) {
-        fn predecessor_locations(
-            body: &'a mir::Body<'tcx>,
-            location: Location,
-        ) -> impl Iterator<Item = Location> + 'a {
-            if location.statement_index == 0 {
-                let predecessors = body.predecessors()[location.block].to_vec();
-                Either::Left(predecessors.into_iter().map(move |bb| body.terminator_loc(bb)))
-            } else {
-                Either::Right(std::iter::once(Location {
-                    statement_index: location.statement_index - 1,
-                    ..location
-                }))
-            }
-        }
-
-        let mut stack = Vec::new();
-        stack.extend(predecessor_locations(self.body, location).map(|predecessor| {
-            let is_back_edge = location.dominates(predecessor, &self.dominators);
-            (predecessor, is_back_edge)
-        }));
-
-        let mut visited = FxHashSet::default();
-        let mut move_locations = FxHashSet::default();
-        let mut reinits = vec![];
-        let mut result = vec![];
-
-        'dfs: while let Some((location, is_back_edge)) = stack.pop() {
-            debug!(
-                "report_use_of_moved_or_uninitialized: (current_location={:?}, back_edge={})",
-                location, is_back_edge
-            );
-
-            if !visited.insert(location) {
-                continue;
-            }
-
-            // check for moves
-            let stmt_kind =
-                self.body[location.block].statements.get(location.statement_index).map(|s| &s.kind);
-            if let Some(StatementKind::StorageDead(..)) = stmt_kind {
-                // this analysis only tries to find moves explicitly
-                // written by the user, so we ignore the move-outs
-                // created by `StorageDead` and at the beginning
-                // of a function.
-            } else {
-                // If we are found a use of a.b.c which was in error, then we want to look for
-                // moves not only of a.b.c but also a.b and a.
-                //
-                // Note that the moves data already includes "parent" paths, so we don't have to
-                // worry about the other case: that is, if there is a move of a.b.c, it is already
-                // marked as a move of a.b and a as well, so we will generate the correct errors
-                // there.
-                let mut mpis = vec![mpi];
-                let move_paths = &self.move_data.move_paths;
-                mpis.extend(move_paths[mpi].parents(move_paths).map(|(mpi, _)| mpi));
-
-                for moi in &self.move_data.loc_map[location] {
-                    debug!("report_use_of_moved_or_uninitialized: moi={:?}", moi);
-                    let path = self.move_data.moves[*moi].path;
-                    if mpis.contains(&path) {
-                        debug!(
-                            "report_use_of_moved_or_uninitialized: found {:?}",
-                            move_paths[path].place
-                        );
-                        result.push(MoveSite { moi: *moi, traversed_back_edge: is_back_edge });
-                        move_locations.insert(location);
-
-                        // Strictly speaking, we could continue our DFS here. There may be
-                        // other moves that can reach the point of error. But it is kind of
-                        // confusing to highlight them.
-                        //
-                        // Example:
-                        //
-                        // ```
-                        // let a = vec![];
-                        // let b = a;
-                        // let c = a;
-                        // drop(a); // <-- current point of error
-                        // ```
-                        //
-                        // Because we stop the DFS here, we only highlight `let c = a`,
-                        // and not `let b = a`. We will of course also report an error at
-                        // `let c = a` which highlights `let b = a` as the move.
-                        continue 'dfs;
-                    }
-                }
-            }
-
-            // check for inits
-            let mut any_match = false;
-            drop_flag_effects::for_location_inits(
-                self.infcx.tcx,
-                &self.body,
-                self.move_data,
-                location,
-                |m| {
-                    if m == mpi {
-                        any_match = true;
-                    }
-                },
-            );
-            if any_match {
-                reinits.push(location);
-                continue 'dfs;
-            }
-
-            stack.extend(predecessor_locations(self.body, location).map(|predecessor| {
-                let back_edge = location.dominates(predecessor, &self.dominators);
-                (predecessor, is_back_edge || back_edge)
-            }));
-        }
-
-        // Check if we can reach these reinits from a move location.
-        let reinits_reachable = reinits
-            .into_iter()
-            .filter(|reinit| {
-                let mut visited = FxHashSet::default();
-                let mut stack = vec![*reinit];
-                while let Some(location) = stack.pop() {
-                    if !visited.insert(location) {
-                        continue;
-                    }
-                    if move_locations.contains(&location) {
-                        return true;
-                    }
-                    stack.extend(predecessor_locations(self.body, location));
-                }
-                false
-            })
-            .collect::<Vec<Location>>();
-        (result, reinits_reachable)
+        get_moved_indexes(
+            self.infcx.tcx,
+            self.body,
+            &self.dominators,
+            self.move_data,
+            location,
+            mpi,
+        )
     }
 
     pub(in crate::borrow_check) fn report_illegal_mutation_of_borrowed(

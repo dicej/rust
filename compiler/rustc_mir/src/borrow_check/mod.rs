@@ -100,6 +100,449 @@ pub fn provide(providers: &mut Providers) {
     };
 }
 
+mod auto_clone {
+    fn maybe_add(
+        tcx: TyCtxt<'tcx>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        use_place: PlaceRef<'tcx>,
+        move_path_index: MovePathIndex,
+    ) {
+        // todo: accept body, param_env, and dominators (generated from body.dominators() in top-level-function) as params
+        if use_place.ty(body, tcx).is_auto_clone(tcx.at(DUMMY_SP), param_env) {
+            let (move_sites, _) = conflict_errors::get_moved_indexes(
+                tcx,
+                body,
+                dominators,
+                move_data,
+                location,
+                move_path_index,
+            );
+
+            for move_site in move_sites {
+                auto_clone_moves.insert(move_data.moves[move_site.moi].location);
+            }
+        }
+    }
+
+    fn move_path_closest_to(move_data: &MoveData<'tcx>, place: PlaceRef<'tcx>) -> MovePathIndex {
+        match move_data.rev_lookup.find(place) {
+            LookupResult::Parent(Some(mpi)) | LookupResult::Exact(mpi) => mpi,
+            LookupResult::Parent(None) => unreachable!(),
+        }
+    }
+
+    fn move_path_for_place(
+        move_data: &MoveData<'tcx>,
+        place: PlaceRef<'tcx>,
+    ) -> Option<MovePathIndex> {
+        match move_data.rev_lookup.find(place) {
+            LookupResult::Parent(_) => None,
+            LookupResult::Exact(mpi) => Some(mpi),
+        }
+    }
+
+    fn check_if_full_path_is_moved(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        use_place: PlaceRef<'tcx>,
+        flow_state: &Flows<'cx, 'tcx>,
+    ) {
+        if uninits.contains(move_path_closest_to(move_data, use_place)) {
+            maybe_add(tcx, move_data, auto_clone_moves, use_place, mpi);
+        }
+    }
+
+    fn check_if_subslice_element_is_moved(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        use_place: PlaceRef<'tcx>,
+        from: u64,
+        to: u64,
+    ) {
+        if let Some(mpi) = move_path_for_place(use_place) {
+            let move_paths = &move_data.move_paths;
+
+            let root_path = &move_paths[mpi];
+            for (child_mpi, child_move_path) in root_path.children(move_paths) {
+                let last_proj = child_move_path.place.projection.last().unwrap();
+                if let ProjectionElem::ConstantIndex { offset, from_end, .. } = last_proj {
+                    debug_assert!(!from_end, "Array constant indexing shouldn't be `from_end`.");
+
+                    if (from..to).contains(offset) {
+                        let uninit_child = move_data
+                            .find_in_move_path_or_its_descendants(child_mpi, |mpi| {
+                                uninits.contains(mpi)
+                            });
+
+                        if let Some(mpi) = uninit_child {
+                            maybe_add(tcx, auto_clone_moves, use_place, mpi);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_if_path_or_subpath_is_moved(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        use_place: PlaceRef<'tcx>,
+    ) {
+        self.check_if_full_path_is_moved(
+            tcx,
+            move_data,
+            uninits,
+            auto_clone_moves,
+            location,
+            use_place,
+        );
+
+        if let Some((place_base, ProjectionElem::Subslice { from, to, from_end: false })) =
+            use_place.last_projection()
+        {
+            let place_ty = place_base.ty(self.body(), self.infcx.tcx);
+            if let ty::Array(..) = place_ty.ty.kind() {
+                check_if_subslice_element_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place_base,
+                    from,
+                    to,
+                );
+                return;
+            }
+        }
+
+        if let Some(mpi) = move_path_for_place(use_place) {
+            let uninit_mpi =
+                move_data.find_in_move_path_or_its_descendants(mpi, |mpi| uninits.contains(mpi));
+
+            if let Some(mpi) = uninit_mpi {
+                maybe_add(tcx, auto_clone_moves, use_place, mpi);
+            }
+        }
+    }
+
+    fn visit_operand(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        operand: &Operand<'tcx>,
+        flow_state: &Flows<'cx, 'tcx>,
+    ) {
+        match operand {
+            Operand::Copy(place) => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place.as_ref(),
+                );
+            }
+            Operand::Move(place) => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place.as_ref(),
+                );
+            }
+            Operand::Constant(_) => {}
+        }
+    }
+
+    fn visit_rvalue(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        (place, span): (Place<'tcx>, Span),
+    ) {
+        match rvalue {
+            Rvalue::Ref(_, _, place) => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place.as_ref(),
+                );
+            }
+
+            Rvalue::AddressOf(mutability, place) => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place.as_ref(),
+                );
+            }
+
+            Rvalue::ThreadLocalRef(_) => {}
+
+            Rvalue::Use(ref operand)
+            | Rvalue::Repeat(ref operand, _)
+            | Rvalue::UnaryOp(_, ref operand)
+            | Rvalue::Cast(_, ref operand, _) => {
+                visit_operand(tcx, move_data, uninits, auto_clone_moves, location, (operand, span))
+            }
+
+            Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place.as_ref(),
+                );
+            }
+
+            Rvalue::BinaryOp(_, box (ref operand1, ref operand2))
+            | Rvalue::CheckedBinaryOp(_, box (ref operand1, ref operand2)) => {
+                visit_operand(tcx, move_data, uninits, auto_clone_moves, location, operand1);
+
+                visit_operand(tcx, move_data, uninits, auto_clone_moves, location, operand2);
+            }
+
+            Rvalue::NullaryOp(_, _) => {}
+
+            Rvalue::Aggregate(_, ref operands) => {
+                for operand in operands {
+                    visit_operand(tcx, move_data, uninits, auto_clone_moves, location, operand);
+                }
+            }
+        }
+    }
+
+    fn mutate_place(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        place: Place<'tcx>,
+        kind: AccessDepth,
+        mode: MutateMode,
+    ) {
+        match mode {
+            MutateMode::WriteAndRead => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place.as_ref(),
+                );
+            }
+            MutateMode::JustWrite => {
+                check_if_assigned_path_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    place,
+                );
+            }
+        }
+    }
+
+    fn check_if_assigned_path_is_moved(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        place: Place<'tcx>,
+    ) {
+        for (place_base, elem) in place.iter_projections().rev() {
+            match elem {
+                ProjectionElem::Index(_)
+                | ProjectionElem::ConstantIndex { .. }
+                | ProjectionElem::Downcast(_, _) => {}
+
+                ProjectionElem::Deref => {
+                    check_if_full_path_is_moved(
+                        tcx,
+                        move_data,
+                        uninits,
+                        auto_clone_moves,
+                        location,
+                        place_base,
+                    );
+                    break;
+                }
+
+                ProjectionElem::Subslice { .. } => unreachable!(),
+
+                ProjectionElem::Field(..) => {
+                    let tcx = self.infcx.tcx;
+                    let base_ty = place_base.ty(self.body(), tcx).ty;
+                    match base_ty.kind() {
+                        ty::Adt(def, _) if def.has_dtor(tcx) => {
+                            check_if_path_or_subpath_is_moved(
+                                tcx,
+                                move_data,
+                                uninits,
+                                auto_clone_moves,
+                                location,
+                                place_base,
+                            );
+                            break;
+                        }
+
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn visit_statement<'mir, 'tcx>(
+        tcx: TyCtxt<'tcx>,
+        move_data: &MoveData<'tcx>,
+        uninits: &BitSet<MovePathIndex>,
+        auto_clone_moves: &mut FxHashSet<Location>,
+        location: Location,
+        statement: &Statement<'tcx>,
+    ) {
+        let span = stmt.source_info.span;
+
+        match &stmt.kind {
+            StatementKind::Assign(box (lhs, ref rhs)) => {
+                visit_rvalue(tcx, move_data, uninits, auto_clone_moves, location, (rhs, span));
+
+                mutate_place(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    *lhs,
+                    Shallow(None),
+                    JustWrite,
+                );
+            }
+            StatementKind::FakeRead(box (_, ref place)) => {
+                check_if_path_or_subpath_is_moved(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    InitializationRequiringAction::Use,
+                    (place.as_ref(), span),
+                );
+            }
+            StatementKind::SetDiscriminant { place, .. } => {
+                mutate_place(
+                    tcx,
+                    move_data,
+                    uninits,
+                    auto_clone_moves,
+                    location,
+                    **place,
+                    Shallow(None),
+                    JustWrite,
+                );
+            }
+            StatementKind::LlvmInlineAsm(ref asm) => {
+                for (o, output) in iter::zip(&asm.asm.outputs, &*asm.outputs) {
+                    if o.is_indirect {
+                        check_if_path_or_subpath_is_moved(
+                            tcx,
+                            move_data,
+                            auto_clone_moves,
+                            uninits,
+                            location,
+                            output.as_ref(),
+                        );
+                    } else {
+                        mutate_place(
+                            tcx,
+                            move_data,
+                            auto_clone_moves,
+                            uninits,
+                            location,
+                            *output,
+                            if o.is_rw { Deep } else { Shallow(None) },
+                            if o.is_rw { WriteAndRead } else { JustWrite },
+                        );
+                    }
+                }
+                for (_, input) in asm.inputs.iter() {
+                    visit_operand(tcx, move_data, uninits, auto_clone_moves, location, input);
+                }
+            }
+            StatementKind::CopyNonOverlapping(_) => unreachable!(),
+            StatementKind::Nop
+            | StatementKind::StorageDead(_)
+            | StatementKind::Coverage(..)
+            | StatementKind::AscribeUserType(..)
+            | StatementKind::Retag { .. }
+            | StatementKind::StorageLive(..) => {}
+        }
+    }
+}
+
+crate fn find_auto_clone_moves<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> FxHashSet<Location> {
+    let def = body.source.with_opt_param().as_local().unwrap();
+    let param_env = tcx.param_env(def.did);
+
+    let move_data = match MoveData::gather_moves(&body, tcx, param_env) {
+        Ok(move_data) | Err((move_data, _)) => move_data,
+    };
+
+    let mdpe = MoveDataParamEnv { move_data, param_env };
+
+    let uninits = MaybeUninitializedPlaces::new(tcx, &body, &mdpe)
+        .into_engine(tcx, &body)
+        .pass_name("find_auto_clone_moves")
+        .iterate_to_fixpoint();
+
+    let mut auto_clone_moves = FxHashSet::new();
+
+    for (block, _) in traversal::reverse_postorder(&body) {
+        for (statement_index, stmt) in block_data.statements.iter().enumerate() {
+            auto_clone::visit_statement(
+                tcx,
+                move_data,
+                &uninits,
+                &mut auto_clone_moves,
+                Location { block, statement_index },
+                &stmt,
+            );
+        }
+    }
+
+    auto_clone_moves
+}
+
 fn mir_borrowck<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: ty::WithOptConstParam<LocalDefId>,
@@ -1395,7 +1838,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     }
                     AggregateKind::Adt(..)
                     | AggregateKind::Array(..)
-                    | AggregateKind::Tuple { .. } => (),
+                    | AggregateKind::Tuple { .. } => {}
                 }
 
                 for operand in operands {
@@ -1721,11 +2164,11 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                 mpi,
             );
         } // Only query longest prefix with a MovePath, not further
-        // ancestors; dataflow recurs on children when parents
-        // move (to support partial (re)inits).
-        //
-        // (I.e., querying parents breaks scenario 7; but may want
-        // to do such a query based on partial-init feature-gate.)
+          // ancestors; dataflow recurs on children when parents
+          // move (to support partial (re)inits).
+          //
+          // (I.e., querying parents breaks scenario 7; but may want
+          // to do such a query based on partial-init feature-gate.)
     }
 
     /// Subslices correspond to multiple move paths, so we iterate through the

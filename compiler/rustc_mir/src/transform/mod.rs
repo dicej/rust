@@ -148,7 +148,11 @@ fn mir_keys(tcx: TyCtxt<'_>, (): ()) -> FxHashSet<LocalDefId> {
 /// type `T`.
 pub fn default_name<T: ?Sized>() -> Cow<'static, str> {
     let name = std::any::type_name::<T>();
-    if let Some(tail) = name.rfind(':') { Cow::from(&name[tail + 1..]) } else { Cow::from(name) }
+    if let Some(tail) = name.rfind(':') {
+        Cow::from(&name[tail + 1..])
+    } else {
+        Cow::from(name)
+    }
 }
 
 /// A streamlined trait that you can implement to create a pass; the
@@ -323,8 +327,16 @@ fn mir_promoted(
 
     run_passes(tcx, &mut body, MirPhase::ConstPromotion, &[promote, opt_coverage]);
 
+    let moves = borrow_check::find_auto_clone_moves(tcx, &body);
+
+    add_auto_clones(tcx, &mut body, &moves);
+
     let promoted = promote_pass.promoted_fragments.into_inner();
     (tcx.alloc_steal_mir(body), tcx.alloc_steal_promoted(promoted))
+}
+
+fn add_auto_clones<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, moves: &FxHashSet<Location>) {
+    todo!();
 }
 
 /// Compute the MIR that is used during CTFE (and thus has no optimizations run on it)

@@ -269,6 +269,7 @@ language_item_table! {
     GeneratorState,          sym::generator_state,     gen_state,                  Target::Enum,           GenericRequirement::None;
     Generator,               sym::generator,           gen_trait,                  Target::Trait,          GenericRequirement::Minimum(1);
     Unpin,                   sym::unpin,               unpin_trait,                Target::Trait,          GenericRequirement::None;
+    AutoClone,               sym::auto_clone,          auto_clone_trait,           Target::Trait,          GenericRequirement::None;
     Pin,                     sym::pin,                 pin_type,                   Target::Struct,         GenericRequirement::None;
 
     PartialEq,               sym::eq,                  eq_trait,                   Target::Trait,          GenericRequirement::Exact(1);
