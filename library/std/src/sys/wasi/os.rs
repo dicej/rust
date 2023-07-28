@@ -50,10 +50,10 @@ cfg_if::cfg_if! {
 pub fn errno() -> i32 {
     extern "C" {
         #[thread_local]
-        static errno: libc::c_int;
+        static __errno: libc::c_int;
     }
 
-    unsafe { errno as i32 }
+    unsafe { __errno as i32 }
 }
 
 pub fn error_string(errno: i32) -> String {
@@ -256,5 +256,9 @@ macro_rules! impl_is_minus_one {
 impl_is_minus_one! { i8 i16 i32 i64 isize }
 
 fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
-    if t.is_minus_one() { Err(io::Error::last_os_error()) } else { Ok(t) }
+    if t.is_minus_one() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(t)
+    }
 }
