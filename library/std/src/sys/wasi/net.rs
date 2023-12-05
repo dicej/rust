@@ -483,7 +483,7 @@ pub mod netc {
         pub imr_interface: in_addr,
     }
 
-    #[repr(C)]
+    #[repr(C, align(16))]
     #[derive(Copy, Clone)]
     pub struct sockaddr_in {
         pub sin_family: sa_family_t,
@@ -504,7 +504,7 @@ pub mod netc {
         pub ipv6mr_interface: c_uint,
     }
 
-    #[repr(C)]
+    #[repr(C, align(16))]
     #[derive(Copy, Clone)]
     pub struct sockaddr_in6 {
         pub sin6_family: sa_family_t,
